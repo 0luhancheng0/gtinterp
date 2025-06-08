@@ -3,7 +3,13 @@ I intend this to be a preliminary exploration on recently deveoped applying mech
 I was initially inspired by [this paper](https://arxiv.org/pdf/2502.12352), which focuse on the investigation of the attention matrix of some simple graph. But the specific techniques used in this paper is somewhat simplistic. In this work, I use transformer-lens library to capture the intermediate representation for more principled characterisation of the potential circuits in GNN. 
 
 
-# Graph Transformer
+Ideally i try to answer the following question 
+1. Is there circuits in graph transformer? E.g. maybe one head learns to identify class 1,2,3 and another learns to identify 4,5,6
+2. Does graph transformers actually use graph inductive bias? E.g. If it just use textual features, does it really hurt the performance? 
+3. Does the graph inductive bias actually help with the task? E.g. Consider a counter-factual graph (in the form of alterantive sparse attention mask), would it be better? (related to graph rewiring approach for solving over-smoothing/over-squashing)
+
+
+# Difference between graph transformer and language transformer
 
 There are many types of graph neural networks. But in their essenece, they are doing message passing on some graph. In particular, graph attention network is equivalent to transformer-based language with the following modification
 
@@ -25,6 +31,14 @@ In the following plot, I run logit attribution again, but only for those nodes h
 ![per head true logit attribution](images/per_head_true_logit_attrs.png)
 
 Here we expect most if not all values to be positive. We can see (1, 1) is pretty indifferent in 0->6 direction for general population, but its not doing well for true samples. 
+
+
+
+![unmasked random](images/unmasked_random.png)
+
+This figure above is one I found kind of interesting. Note that this is from a regular transformer trained on cora dataset, which means random orthogonal positional encoding and no masking. It seems like the head in the first layer is pushing the prediction towards later half of classes, and the head in the second layer is pushing prediction towards odd classes. This kind of make sense as our output vocab can be directly thought as feature direction. So i guess this could be another example of superposition if i'm not reading too much into it.
+
+
 
 Now im kinda stuck, because we don't actually understand the input tokens. Note that the features of cora are a bunch of one-hot encoding of words but I cannot find the underlying vocabulary even after scortching the internet.
 
@@ -57,5 +71,7 @@ This roughly tells you that during the training, the attention matrix learned te
 
 So how does graph transformer incorporate graph into learning? There are 2 kinds of privileged basis specification on graph information. The positional embedding and the attention mask. The positional encoding is probably easier to interpret as it is commonly just chosen as the first d_model eigenvectors of the graph laplacian. 
 
+TODO:
+- I plan to first ablate the attention mask component to isolate the impact of the positional encoding. Since the start of the residual stream is just $W_E + W_{pos}$ it should be possible to fully characterise the interactions between them. Ideally we should also be able to figure out how their interactions are learned during the training therefore see if graph transformer is really using the graph. 
 
 
