@@ -1,5 +1,6 @@
 %matplotlib inline
 from torch_geometric.utils import to_undirected, degree, get_ppr, get_laplacian
+from lightning.pytorch.utilities import grad_norm
 from pathlib import Path
 import pandas as pd
 import graph_tool.all as gt
@@ -32,7 +33,7 @@ import torch
 from tensordict import TensorDict
 import torch.nn.functional as F
 import types
-from torch_geometric.utils import mask_to_index, homophily, to_cugraph, to_networkx, subgraph, k_hop_subgraph, dense_to_sparse
+from torch_geometric.utils import mask_to_index, homophily, to_cugraph, to_networkx, subgraph, k_hop_subgraph, dense_to_sparse, index_to_mask
 from torchmetrics.functional import accuracy, confusion_matrix, f1_score
 
 from jaxtyping import Float, Int
@@ -77,7 +78,7 @@ def cross_entropy(data, model, logits, tokens, attention_mask=None, per_token=Fa
 
 
 class GraphTransformer(L.LightningModule):
-    def __init__(self, cfg: HookedTransformerConfig, data: Data, apply_neighbor_mask: bool, lr=1e-2, weight_decay=1e-4, random_orthogonal_pos_init=False):
+    def __init__(self, cfg: HookedTransformerConfig, data: Data, apply_neighbor_mask: bool, lr=1e-2, weight_decay=1e-4):
         super().__init__()
         # self.save_hyperparameters()
         self.cfg = cfg
@@ -85,10 +86,10 @@ class GraphTransformer(L.LightningModule):
 
         self.model.embed.W_E.data = data.x
         self.model.embed.W_E.requires_grad = False
-        if random_orthogonal_pos_init:
-            self.model.pos_embed.W_pos.data = torch.nn.init.orthogonal(torch.empty(data.num_nodes, cfg.d_model))
-        else:
-            self.model.pos_embed.W_pos.data = data.laplacian_eigenvector_pe
+        # if random_orthogonal_pos_init:
+        #     self.model.pos_embed.W_pos.data = torch.nn.init.orthogonal(torch.empty(data.num_nodes, cfg.d_model))
+        # else:
+        self.model.pos_embed.W_pos.data = data.pos
         self.model.pos_embed.W_pos.requires_grad = False
         self.cache_dict, self.caching_hooks, _ = self.model.get_caching_hooks(incl_bwd=False)
         # self.register_module("cache_dict", self.cache_dict)
@@ -126,17 +127,26 @@ class GraphTransformer(L.LightningModule):
         return head_results
     @property
     def WE(self):
-        return self.model.embed.W_E
+        return self.model.embed.W_E.data
+    @property
+    def WPos(self):
+        return self.model.pos_embed.W_pos.data
     @property
     def WU(self):
-        return self.model.unembed.W_U
+        return self.model.unembed.W_U.data
+    @property
+    def QK(self):
+        return self.model.QK
+    @property
+    def OV(self):
+        return self.model.OV
     @property
     def QK_full(self):
-        return self.WE @ self.model.QK @ self.WE.T
+        return (self.WE + self.WPos) @ self.model.QK @ (self.WE + self.WPos).T
     @property
     def OV_full(self):
-        return self.WE @ self.model.OV @ self.WU
-    
+        return (self.WE + self.WPos) @ self.model.OV @ self.WU
+
     def forward(self, idx, update_cache=False, custom_hooks=[], **kwargs):
         fwd_hooks = []
         if update_cache:
@@ -339,16 +349,6 @@ class GraphTransformer(L.LightningModule):
         )
         return einsum(scaled_residual_stack, logit_directions, "... d_model, d_model c1 c2 -> ... c1 c2")
 
-    # @torch.no_grad()   
-    # def layer_head_logit_attrs(self) -> Float[torch.Tensor, "y_true y_pred layer head batch nodes"]:
-    #     head_results = self.stack_head_results()
-    #     cache = self.get_cache()
-    #     explainer = partial(cache.logit_attrs, head_results)
-    #     all_pair = torch.cartesian_prod(torch.arange(self.num_classes), torch.arange(self.num_classes)) # Corrected: self.data.num_classes to self.num_classes
-    #     res = torch.stack([explainer(x, y) for x, y in all_pair])
-    #     res = rearrange(res, "(class1 class2) layer head batch node -> layer head class1 class2 batch node", class1=self.num_classes, class2=self.num_classes)
-    #     return res
-
     @property
     def all_class_pair_indices(self):
         allpairidx = torch.cartesian_prod(torch.arange(self.num_classes), torch.arange(self.num_classes))
@@ -360,18 +360,13 @@ class GraphTransformer(L.LightningModule):
         directions = WU[:, self.all_class_pair_indices[:, 0]] - WU[:, self.all_class_pair_indices[:, 1]]
         directions = rearrange(directions, "d_model (c1 c2) -> d_model c1 c2", c1=self.num_classes, c2=self.num_classes)
         return directions
-    # def on_train_end(self):
-    #     return self.update_cache()
-# class EnsureCacheUpdated(Callback):
-#     def on_train_epoch_end(self, trainer, pl_module):
-#         pl_module.update_cache()
-
-#     def on_train_end(self, trainer, pl_module):
-#         pl_module.update_cache()
-
-
-
-
+    @property
+    def query_side(self) -> Float[Tensor, "layer head d_model"]:
+        return self.QK.U * self.QK.S[..., None, :].sqrt()
+    @property
+    def key_side(self) -> Float[Tensor, "layer head d_model"]:
+        return self.QK.S[..., :, None].sqrt() * self.QK.Vh.transpose(-1, -2)
+    
 def get_samples_maximise_loss(model, data, num_samples=100):
     output = model(torch.arange(data.num_nodes).to(device))
     per_sample_loss = F.cross_entropy(output.logits.squeeze(), data.y, reduction="none")
@@ -389,11 +384,11 @@ d_head = 8
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def prepare(masked, random_pos_encoding, dataset_name, n_layers, n_heads):
-    exp_prefix = f"{'masked' if masked else 'unmasked'}_{'random' if random_pos_encoding else 'lappe'}_{dataset_name}_{n_layers}_{n_heads}"
+def prepare(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads):
+    exp_prefix = f"{'masked' if masked else 'unmasked'}_{'random' if random_orthogonal_pos_init else 'lappe'}_{dataset_name}_{n_layers}_{n_heads}"
     
     L.seed_everything(123)
-    data = load_dataset(dataset_name, split="full", d_model=d_model).to(device)
+    data = load_dataset(dataset_name, split="full", d_model=d_model, random_orthogonal_pos_init=random_orthogonal_pos_init).to(device)
     datamodule = GraphDataModule(data)
     cfg = HookedTransformerConfig(
         d_model=d_model,
@@ -429,61 +424,81 @@ def prepare(masked, random_pos_encoding, dataset_name, n_layers, n_heads):
         logger=logger,
     )
 
-    model = GraphTransformer(cfg, data, apply_neighbor_mask=masked, random_orthogonal_pos_init=random_pos_encoding)
+    model = GraphTransformer(cfg, data, apply_neighbor_mask=masked)
     return trainer, model, datamodule
 
+def load_model(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads):
+    trainer, model, _ = prepare(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads)
+    ckpt = torch.load(f"{trainer.logger.log_dir}/checkpoints/last.ckpt", map_location=device)
+    model.load_state_dict(ckpt['state_dict'])
+    model.update_cache()
+    return model
 
-def run(masked, random_pos_encoding, dataset_name, n_layers, n_heads):
-    trainer, model, datamodule = prepare(masked, random_pos_encoding, dataset_name, n_layers, n_heads)
-
+def run(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads):
+    trainer, model, datamodule = prepare(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads)
     trainer.fit(model, datamodule)
     return trainer
 
+def run_all():
+    for dataset_name in ["cora", "citeseer"]:
+        for n_layers, n_heads in [(1, 1), (2, 1), (1, 2), (2, 2)]:
+            for masked in [True, False]:
+                for random_orthogonal_pos_init in [True, False]:
+                    run(masked=masked, random_orthogonal_pos_init=random_orthogonal_pos_init, dataset_name=dataset_name, n_layers=n_layers, n_heads=n_heads)
 
-n_heads = 2
-n_layers = 2
-dataset_name = "cora"
-masked = True
-random_pos_encoding = False
-# trainer = run(masked=masked, random_pos_encoding=random_pos_encoding, dataset_name=dataset_name, n_layers=n_layers, n_heads=n_heads)
-trainer, model, datamodule = prepare(masked, random_pos_encoding, dataset_name, n_layers, n_heads)
-ckpt = torch.load(f"{trainer.logger.log_dir}/checkpoints/last.ckpt", map_location=device)
-model.load_state_dict(ckpt['state_dict'])
-model.update_cache()
+# n_heads = 2
+# n_layers = 2
+# dataset_name = "cora"
+# masked = True
+# random_orthogonal_pos_init = True
+# run(masked=masked, random_orthogonal_pos_init=random_orthogonal_pos_init, dataset_name=dataset_name, n_layers=n_layers, n_heads=n_heads)
 
-
-W_pos = model.model.pos_embed.W_pos
-W_E = model.model.embed.W_E
-Q_composition = model.model.QK[1].T @ model.model.OV[0]
-K_composition = model.model.QK[1] @ model.model.OV[0]
-V_composition = model.model.OV[1] @ model.model.OV[0]
-
-W_pos @ Q_composition @ W_pos.T
-
-
-
-# from homophily import label_informativeness
-# QK = model.model.pos_embed.W_pos @ model.model.QK  @ model.model.pos_embed.W_pos.swapaxes(-1, -2)
-# QK = model.model.embed.W_E @ model.model.QK  @ model.model.pos_embed.W_pos.swapaxes(-1, -2)
-# QK = model.model.pos_embed.W_pos @ model.model.QK  @ model.model.embed.W_E.swapaxes(-1, -2)
-# QK = model.model.embed.W_E @ model.model.QK  @ model.model.embed.W_E.swapaxes(-1, -2)
-# label_informativeness(QK.AB.softmax(dim=-1), datamodule.data.y)
-
-
-# trainer.callbacks[0].load_state_dict(ckpt['callbacks']['LogTrainingAttention'])
-# trainer.callbacks[0].compute(model)
+# trainer, model, datamodule = prepare(masked=True, random_orthogonal_pos_init=True, dataset_name="cora", n_layers=2, n_heads=2)
 
 
 
 
-
-# for dataset_name in ["cora", "citeseer"]:
-#     for n_layers, n_heads in [(1, 1), (2, 1), (1, 2), (2, 2)]:
-#         for masked in [True, False]:
-#             for random_pos_encoding in [True, False]:
-#                 run(masked=masked, random_pos_encoding=random_pos_encoding, dataset_name=dataset_name, n_layers=n_layers, n_heads=n_heads)
+lap = load_model(masked=True, random_orthogonal_pos_init=False, dataset_name="cora", n_layers=2, n_heads=2)
+ortho = load_model(masked=True, random_orthogonal_pos_init=True, dataset_name="cora", n_layers=2, n_heads=2)
 
 
 
+def plot_grid_hist(scores: Float[torch.Tensor, "layer head node hue"], title: str, xlabel, ylabel, columns=None):
+    df_list = []
+    n_layers, n_heads = scores.shape[:2]
+    for layer in range(n_layers):
+        for head in range(n_heads):
+            df_temp = pd.DataFrame(scores[layer, head].detach().cpu().numpy(), columns=columns)
+            df_temp['source'] = f'layer_{layer}_head_{head}'
+            df_list.append(df_temp)
+
+    df = pd.concat(df_list, ignore_index=True)
+    fig, axes = plt.subplots(figsize=(10, 6), nrows=n_layers, ncols= n_heads, sharex=True, sharey=True)
+    for i, ax in enumerate(axes.flat):
+        sns.histplot(df, ax=ax)
+        ax.set(xlabel=xlabel, ylabel=ylabel, title=f"Layer {i//n_layers}, Head {i%n_heads}")
+    fig.suptitle(title)
+    fig.tight_layout()
+    return fig
 
 
+model = lap
+singular_direction_idx = 2
+
+
+
+torch.kl_div((model.WE @ model.query_side)[..., 0].log(), (model.WPos @ model.query_side)[..., 0])
+
+query_scores = torch.cat([
+    model.WE @ model.query_side[..., singular_direction_idx, None], 
+    model.WPos @ model.query_side[..., singular_direction_idx, None],
+], dim=-1)
+
+plot_grid_hist(query_scores, title="How well does WE align with U*sqrt(S)", xlabel="Scores on singular vectors", ylabel="Count", columns=["WE", "WPos"])
+
+key_scores = torch.cat([
+    model.WE @ model.key_side.transpose(-1, -2)[..., singular_direction_idx, None], 
+    model.WPos @ model.key_side.transpose(-1, -2)[..., singular_direction_idx, None],
+], dim=-1)
+
+plot_grid_hist(key_scores, title="How well does WE align with sqrt(S)*V.T", xlabel="Scores on singular vectors", ylabel="Count", columns=["WE", "WPos"])

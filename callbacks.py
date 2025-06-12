@@ -1,12 +1,13 @@
 from lightning.pytorch.callbacks import Callback
 import torch
+from torch_scatter import scatter_mean
 from functools import partial
 from pathlib import Path
 from plotting import plot_heatmap, plot_epoch_layer_head_curves, plot_grid_heatmaps
 from torch import Tensor
 from jaxtyping import Float, Int
 from transformer_lens import utils
-from einops import reduce
+from einops import reduce, repeat
 import matplotlib.pyplot as plt
 from torch_geometric.utils import mask_to_index
 from homophily import label_informativeness, edge_homophily
@@ -219,41 +220,128 @@ class LogTrainingAttention(BaseAnalysisCallback):
 
 
 class LogitAttribution(BaseAnalysisCallback):
+    """Analyzes logit attributions across heads and layers for different node classifications."""
 
     def __init__(self):
         super().__init__()
+        # Raw computation results
         self.head_results: Float[Tensor, "layer head node d_model"] = None
         self.logit_attrs: Float[Tensor, "layer head nodes c_true c_pred"] = None
         
+        # Average logit attributions (baseline)
         self.avg_logits_per_layer_head: Float[Tensor, "layer head c_true c_pred"] = None
         self.avg_logits_sum_all: Float[Tensor, "c_true c_pred"] = None
         
+        # True class specific logit attributions
         self.true_logits_per_layer_head: Float[Tensor, "layer head c_true c_pred"] = None
         self.true_logits_sum_all: Float[Tensor, "c_true c_pred"] = None
-        
         self.normed_true_logits_per_layer_head: Float[Tensor, "layer head c_true c_pred"] = None
         self.normed_true_logits_sum_all: Float[Tensor, "c_true c_pred"] = None
 
+        # Predicted class specific logit attributions
+        self.pred_logits_per_layer_head: Float[Tensor, "layer head c_true c_pred"] = None
+        self.pred_logits_sum_all: Float[Tensor, "c_true c_pred"] = None
+        self.normed_pred_logits_per_layer_head: Float[Tensor, "layer head c_true c_pred"] = None
+        self.normed_pred_logits_sum_all: Float[Tensor, "c_true c_pred"] = None
+
     def compute(self, pl_module):
+        """Main computation method that orchestrates all logit attribution calculations."""
+        # Extract base data
+        self._extract_base_data(pl_module)
+        
+        # Compute predictions
+        pred = self._get_predictions(pl_module)
+        
+        # Compute all attribution metrics
+        self._compute_average_logits()
+        self._compute_true_class_logits(pl_module)
+        self._compute_predicted_class_logits(pl_module, pred)
+        self._compute_normalized_metrics()
+
+    def _extract_base_data(self, pl_module):
+        """Extract head results and logit attributions from the model."""
         pl_module.update_cache()
         self.head_results = pl_module.stack_head_results()
         self.logit_attrs = pl_module.all_class_pair_logit_lens(self.head_results).squeeze(2)
-        self.avg_logits_per_layer_head = reduce(self.logit_attrs, "layer head nodes c_true c_pred -> layer head c_true c_pred", "mean")
-        self.avg_logits_sum_all = reduce(self.avg_logits_per_layer_head, "layer head c_true c_pred -> c_true c_pred", "sum")
-        
 
-        true_logits_list = []
-        for class_i in range(pl_module.num_classes):
-            true_logits = self.logit_attrs[..., pl_module.data.y == class_i, class_i, :].mean(dim=-2) # average over indexed nodes
-            true_logits_list.append(true_logits)
-        self.true_logits_per_layer_head: Float[Tensor, "layer head c_true c_pred"] = torch.stack(true_logits_list, dim=-2)
-        self.true_logits_sum_all = reduce(self.true_logits_per_layer_head, "layer head c_true c_pred -> c_true c_pred", "sum")
+    def _get_predictions(self, pl_module):
+        """Get model predictions for all nodes."""
+        return pl_module(torch.arange(pl_module.data.num_nodes), update_cache=False).logits.argmax(dim=-1).squeeze()
 
-        
+    def _compute_average_logits(self):
+        """Compute average logit attributions across all nodes (baseline)."""
+        self.avg_logits_per_layer_head = reduce(
+            self.logit_attrs, 
+            "layer head nodes c_true c_pred -> layer head c_true c_pred", 
+            "mean"
+        )
+        self.avg_logits_sum_all = reduce(
+            self.avg_logits_per_layer_head, 
+            "layer head c_true c_pred -> c_true c_pred", 
+            "sum"
+        )
+
+    def _compute_true_class_logits(self, pl_module):
+        """Compute logit attributions for nodes grouped by their true class."""
+        self.true_logits_per_layer_head = self._compute_logit_attrs_per_class(pl_module, pl_module.data.y)
+        self.true_logits_sum_all = reduce(
+            self.true_logits_per_layer_head, 
+            "layer head c_true c_pred -> c_true c_pred", 
+            "sum"
+        )
+
+    def _compute_predicted_class_logits(self, pl_module, pred):
+        """Compute logit attributions for nodes grouped by their predicted class."""
+        self.pred_logits_per_layer_head = self._compute_logit_attrs_per_class(pl_module, pred).swapaxes(-1, -2)
+        self.pred_logits_sum_all = reduce(
+            self.pred_logits_per_layer_head, 
+            "layer head c_true c_pred -> c_true c_pred", 
+            "sum"
+        )
+
+    def _compute_normalized_metrics(self):
+        """Compute normalized metrics (difference from average baseline)."""
+        # True class normalized metrics
         self.normed_true_logits_per_layer_head = self.true_logits_per_layer_head - self.avg_logits_per_layer_head
         self.normed_true_logits_sum_all = self.true_logits_sum_all - self.avg_logits_sum_all
+
+        # Predicted class normalized metrics
+        self.normed_pred_logits_per_layer_head = self.pred_logits_per_layer_head - self.avg_logits_per_layer_head
+        self.normed_pred_logits_sum_all = self.pred_logits_sum_all - self.avg_logits_sum_all
+
+    def _compute_logit_attrs_per_class(self, pl_module, index_over_class):
+        """
+        Compute logit attributions grouped by class.
+        
+        Args:
+            pl_module: Lightning module instance
+            index_over_class: Tensor containing class indices for each node
+            
+        Returns:
+            Float[Tensor, "layer head c_true c_pred"]: Averaged logit attributions per class
+        """
+        layer, head, nodes, c1, c2 = self.logit_attrs.shape
+        idx = index_over_class[None, None, :, None, None].expand(layer, head, -1, 1, c2)
+        logits = self.logit_attrs.gather(index=idx, dim=-2).squeeze()  # shape: layer, head, nodes, c2
+
+        return scatter_mean(src=logits, index=index_over_class, dim=-2, dim_size=pl_module.num_classes)
+
+
     def plot(self):
-        fig_dict = {
+        """Create all plots for logit attribution analysis."""
+        fig_dict = {}
+        
+        # Add plots for each metric category
+        fig_dict.update(self._plot_average_logits())
+        fig_dict.update(self._plot_true_class_logits())
+        fig_dict.update(self._plot_predicted_class_logits())
+        fig_dict.update(self._plot_normalized_logits())
+        
+        return fig_dict
+
+    def _plot_average_logits(self):
+        """Create plots for average logit attributions (baseline)."""
+        return {
             "avg_logits_per_layer_head": plot_grid_heatmaps(
                 data_tensor=self.avg_logits_per_layer_head,
                 title_prefix="Average Logit Attribution per Head (All Nodes)",
@@ -265,7 +353,12 @@ class LogitAttribution(BaseAnalysisCallback):
                 title="Sum of Average Logit Attributions (All Nodes, All Heads/Layers)",
                 xlabel="From Class",
                 ylabel="To Class"
-            ),
+            )
+        }
+
+    def _plot_true_class_logits(self):
+        """Create plots for true class logit attributions."""
+        return {
             "true_logits_per_layer_head": plot_grid_heatmaps(
                 data_tensor=self.true_logits_per_layer_head,
                 title_prefix="Average Logit Attribution per Head (Nodes of True Class)",
@@ -277,7 +370,29 @@ class LogitAttribution(BaseAnalysisCallback):
                 title="Sum of Average Logit Attributions (Nodes of True Class, All Heads/Layers)",
                 xlabel="From Class",
                 ylabel="To Class"
+            )
+        }
+
+    def _plot_predicted_class_logits(self):
+        """Create plots for predicted class logit attributions."""
+        return {
+            "pred_logits_per_layer_head": plot_grid_heatmaps(
+                data_tensor=self.pred_logits_per_layer_head,
+                title_prefix="Average Logit Attribution per Head (Nodes of Predicted Class)",
+                xlabel="From Class",
+                ylabel="To Class"
             ),
+            "pred_logits_sum_all": plot_heatmap(
+                data_tensor=self.pred_logits_sum_all,
+                title="Sum of Average Logit Attributions (Nodes of Predicted Class, All Heads/Layers)",
+                xlabel="From Class",
+                ylabel="To Class"
+            )
+        }
+
+    def _plot_normalized_logits(self):
+        """Create plots for normalized (difference from baseline) logit attributions."""
+        return {
             "normed_true_logits_per_layer_head": plot_grid_heatmaps(
                 data_tensor=self.normed_true_logits_per_layer_head,
                 title_prefix="Difference: (True Class Nodes Avg Logit Attr) - (All Nodes Avg Logit Attr) per Head",
@@ -289,9 +404,20 @@ class LogitAttribution(BaseAnalysisCallback):
                 title="Sum of Difference: (True Class Nodes Avg Logit Attr) - (All Nodes Avg Logit Attr)",
                 xlabel="From Class",
                 ylabel="To Class"
+            ),
+            "normed_pred_logits_per_layer_head": plot_grid_heatmaps(
+                data_tensor=self.normed_pred_logits_per_layer_head,
+                title_prefix="Difference: (Predicted Class Nodes Avg Logit Attr) - (All Nodes Avg Logit Attr) per Head",
+                xlabel="From Class",
+                ylabel="To Class"
+            ),
+            "normed_pred_logits_sum_all": plot_heatmap(
+                data_tensor=self.normed_pred_logits_sum_all,
+                title="Sum of Difference: (Predicted Class Nodes Avg Logit Attr) - (All Nodes Avg Logit Attr)",
+                xlabel="From Class",
+                ylabel="To Class"
             )
         }
-        return fig_dict
 
     def log_plots(self, trainer, pl_module, prefix: str = "LogitsAttribution"):
         """Log all plots to trainer with LogitsAttribution prefix."""

@@ -20,12 +20,12 @@ import graph_tool.all as gt
 PYG_DATASET_ROOT = "/home/lcheng/oz318/datasets/pytorch_geometric"
 
 class StandardizeNodeFeatures(T.BaseTransform):
-    def __init__(self, eps=1e-6, keys=["x"]):
+    def __init__(self, eps=1e-6, keys=["x", "pos"]):
         super().__init__()
         self.eps = eps
         self.keys = keys
 
-    def __call__(self, data):
+    def forward(self, data):
         for key in self.keys:
             mean = data[key].mean(dim=0)
             variance = data[key].var(dim=0)
@@ -120,8 +120,17 @@ class GraphDataModule(L.LightningDataModule):
     def predict_dataloader(self):
         return torch.arange(self.data.num_nodes).unsqueeze(0)
 
+class OrthogonalPositionalEncoding(T.BaseTransform):
+    def __init__(self, k, attr_name="pos"):
+        super().__init__()
+        self.k = k
+        self.attr_name = attr_name
+    def forward(self, data):
+        data[self.attr_name] = torch.nn.init.orthogonal_(torch.empty(data.num_nodes, self.k))
+        return data
+    
 
-def load_dataset(dataset_name, split="public", num_train_per_class=20, num_val=500, num_test=1000, d_model=128, add_virtual_nodes=False, self_loops=True, undirected=True):
+def load_dataset(dataset_name, split="public", num_train_per_class=20, num_val=500, num_test=1000, d_model=128, add_virtual_nodes=False, self_loops=True, undirected=True, random_orthogonal_pos_init=False):
     """Load a dataset (Cora, Citeseer, or PubMed) with specified transformations."""
     # Map dataset names to Planetoid dataset names
     dataset_map = {
@@ -142,12 +151,16 @@ def load_dataset(dataset_name, split="public", num_train_per_class=20, num_val=5
     if undirected:
         transforms.append(T.ToUndirected())
         
+    if random_orthogonal_pos_init:
+        transforms.append(OrthogonalPositionalEncoding(k=d_model, attr_name="pos"))
+    else:
+        transforms.append(T.AddLaplacianEigenvectorPE(k=d_model, attr_name="pos"))
+        
     transforms.extend([
         SVDFeatureReduction(out_channels=d_model),
-        T.AddLaplacianEigenvectorPE(k=d_model),
         T.ToDense(),
         AddNumClasses(),
-        StandardizeNodeFeatures(eps=1e-6, keys=["x", "laplacian_eigenvector_pe"])
+        StandardizeNodeFeatures(eps=1e-6, keys=["x", "pos"])
     ])
     
     transforms = T.Compose(transforms)
