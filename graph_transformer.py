@@ -7,7 +7,7 @@ import graph_tool.all as gt
 from pygio import pyg_to_gt
 from einops import einsum, reduce, rearrange, repeat
 from torch_geometric.transforms import VirtualNode
-from plotting import plot_heatmap, plot_grid_heatmaps, plot_epoch_layer_head_curves
+from plotting import plot_heatmap, plot_grid_heatmaps, plot_epoch_layer_head_curves, plot_grid_hist
 import plotly.express as px
 import matplotlib.pyplot as plt
 from callbacks import LogTrainingAttention, LogitAttribution, HeadAblationCallback, get_block_index_set_from_mask
@@ -36,7 +36,7 @@ import types
 from torch_geometric.utils import mask_to_index, homophily, to_cugraph, to_networkx, subgraph, k_hop_subgraph, dense_to_sparse, index_to_mask
 from torchmetrics.functional import accuracy, confusion_matrix, f1_score
 
-from jaxtyping import Float, Int
+from jaxtyping import Float, Int, Bool
 from transformer_lens.hook_points import HookPoint
 
 from torch import optim
@@ -49,7 +49,7 @@ from functools import partial
 import einops
 import numpy as np
 DATASET_ROOT = "/home/lcheng/oz318/datasets/pytorch_geometric"
-
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def attention_mask_hook_factory(
@@ -360,14 +360,26 @@ class GraphTransformer(L.LightningModule):
         directions = WU[:, self.all_class_pair_indices[:, 0]] - WU[:, self.all_class_pair_indices[:, 1]]
         directions = rearrange(directions, "d_model (c1 c2) -> d_model c1 c2", c1=self.num_classes, c2=self.num_classes)
         return directions
+
     @property
-    def query_side(self) -> Float[Tensor, "layer head d_model"]:
+    def query_side(self) -> Float[Tensor, "layer head d_model d_head"]:
         return self.QK.U * self.QK.S[..., None, :].sqrt()
+
     @property
-    def key_side(self) -> Float[Tensor, "layer head d_model"]:
+    def key_side(self) -> Float[Tensor, "layer head d_head d_model"]:
         return self.QK.S[..., :, None].sqrt() * self.QK.Vh.transpose(-1, -2)
-    
-def get_samples_maximise_loss(model, data, num_samples=100):
+
+    def query_scores(self, embeddings: Float[Tensor, "... node d_model"]) -> Float[Tensor, "... layer head node d_head"]:
+        query_scores = einsum(embeddings , self.query_side, "... node d_model, layer head d_model d_head -> ... layer head node d_head")
+        return query_scores
+
+    def key_scores(self, embeddings: Float[Tensor, "... node d_model"]) -> Float[Tensor, "... layer head node d_head"]:
+        key_scores = einsum(embeddings, self.key_side, "... node d_model, layer head d_head d_model -> ... layer head node d_head")
+        return key_scores
+
+
+
+def get_samples_maximise_loss(model, data, num_samples=100, device=DEVICE):
     output = model(torch.arange(data.num_nodes).to(device))
     per_sample_loss = F.cross_entropy(output.logits.squeeze(), data.y, reduction="none")
     idx = per_sample_loss.topk(num_samples, dim=-1)
@@ -376,20 +388,21 @@ def get_samples_maximise_loss(model, data, num_samples=100):
     return output, y_true, y_pred, idx
 
 
-
 d_model = 32
 max_epochs = 50
 d_head = 8
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def prepare(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads):
+
+
+def prepare(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads, device=DEVICE):
     exp_prefix = f"{'masked' if masked else 'unmasked'}_{'random' if random_orthogonal_pos_init else 'lappe'}_{dataset_name}_{n_layers}_{n_heads}"
     
     L.seed_everything(123)
     data = load_dataset(dataset_name, split="full", d_model=d_model, random_orthogonal_pos_init=random_orthogonal_pos_init).to(device)
     datamodule = GraphDataModule(data)
+    
     cfg = HookedTransformerConfig(
         d_model=d_model,
         d_head=d_head,
@@ -427,7 +440,7 @@ def prepare(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads)
     model = GraphTransformer(cfg, data, apply_neighbor_mask=masked)
     return trainer, model, datamodule
 
-def load_model(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads):
+def load_model(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads, device=DEVICE):
     trainer, model, _ = prepare(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads)
     ckpt = torch.load(f"{trainer.logger.log_dir}/checkpoints/last.ckpt", map_location=device)
     model.load_state_dict(ckpt['state_dict'])
@@ -446,59 +459,62 @@ def run_all():
                 for random_orthogonal_pos_init in [True, False]:
                     run(masked=masked, random_orthogonal_pos_init=random_orthogonal_pos_init, dataset_name=dataset_name, n_layers=n_layers, n_heads=n_heads)
 
-# n_heads = 2
-# n_layers = 2
-# dataset_name = "cora"
-# masked = True
-# random_orthogonal_pos_init = True
-# run(masked=masked, random_orthogonal_pos_init=random_orthogonal_pos_init, dataset_name=dataset_name, n_layers=n_layers, n_heads=n_heads)
 
-# trainer, model, datamodule = prepare(masked=True, random_orthogonal_pos_init=True, dataset_name="cora", n_layers=2, n_heads=2)
+# run(masked=True, random_orthogonal_pos_init=False, dataset_name="citeseer", n_layers=2, n_heads=2)
 
+trainer, model, datamodule = prepare(masked=True, random_orthogonal_pos_init=False, dataset_name="cora", n_layers=2, n_heads=2)
 
+# model = load_model(masked=True, random_orthogonal_pos_init=False, dataset_name="cora", n_layers=2, n_heads=2)
 
-
-lap = load_model(masked=True, random_orthogonal_pos_init=False, dataset_name="cora", n_layers=2, n_heads=2)
-ortho = load_model(masked=True, random_orthogonal_pos_init=True, dataset_name="cora", n_layers=2, n_heads=2)
+# WE_key_scores = rearrange(model.key_scores(model.WE), "... d_head -> d_head ...")
+# WE_query_scores = rearrange(model.query_scores(model.WE), "... d_head -> d_head ...")
+# WPos_key_scores = rearrange(model.key_scores(model.WPos), "... d_head -> d_head ...")
+# WPos_query_scores = rearrange(model.query_scores(model.WPos), "... d_head -> d_head ...")
 
 
+class QueryKey:
+    def __init__(self, model, sigma=3):
+        self.model = model
+        self.sigma = sigma
+        self.WE = self.model.WE
+        self.WPos = self.model.WPos
+        self.scores = self.get_scores()
+        self.graph = pyg_to_gt(self.model.data)
+        self.lower, self.upper = self.get_bounds(self.scores)
+        self.lower_outlier_mask = self.scores < self.lower
+        self.upper_outlier_mask = self.scores > self.upper
 
-def plot_grid_hist(scores: Float[torch.Tensor, "layer head node hue"], title: str, xlabel, ylabel, columns=None):
-    df_list = []
-    n_layers, n_heads = scores.shape[:2]
-    for layer in range(n_layers):
-        for head in range(n_heads):
-            df_temp = pd.DataFrame(scores[layer, head].detach().cpu().numpy(), columns=columns)
-            df_temp['source'] = f'layer_{layer}_head_{head}'
-            df_list.append(df_temp)
+    def get_bounds(self, scores, dim=-2):
+        upper = (scores.mean(dim=dim) + self.sigma * scores.std(dim=dim)).unsqueeze(dim)
+        lower = (scores.mean(dim=dim) - self.sigma * scores.std(dim=dim)).unsqueeze(dim)
+        return lower, upper
+    @torch.no_grad()
+    def get_scores(self) -> Float[Tensor, "qk ep layer head node d_model"]:
+        query_scores = self.model.query_scores(torch.stack([self.WE, self.WPos], dim=0))
+        key_scores = self.model.key_scores(torch.stack([self.WE, self.WPos], dim=0))
+        return torch.stack([query_scores, key_scores], dim=0)
 
-    df = pd.concat(df_list, ignore_index=True)
-    fig, axes = plt.subplots(figsize=(10, 6), nrows=n_layers, ncols= n_heads, sharex=True, sharey=True)
-    for i, ax in enumerate(axes.flat):
-        sns.histplot(df, ax=ax)
-        ax.set(xlabel=xlabel, ylabel=ylabel, title=f"Layer {i//n_layers}, Head {i%n_heads}")
-    fig.suptitle(title)
-    fig.tight_layout()
-    return fig
+    def draw_upper_outlier(self, qk, ep, layer, head, k, **kwargs):
+        vp = self.graph.new_vp("bool", ~self.upper_outlier_mask[qk, ep, layer, head, :, k])
+        return self._draw_with_vertex_mask(vp, **kwargs)
+
+    def _draw_with_vertex_mask(self, vertex_mask: Bool[torch.Tensor, "node"], **kwargs):
+        return gt.graph_draw(g=self.graph, pos=self.graph.vp['pos'], vertex_fill_color=vertex_mask, bg_color=(0, 0, 0, 1), **kwargs)
+    def plot_hist(self, qk, k, add_random_matrix=False):
+        scores = self.scores[qk, ..., k]
+        columns = ["WE", "WPos"]
+        if add_random_matrix:
+            random_matrix = torch.randn_like(scores[0]).unsqueeze(0)
+            scores = torch.cat([scores, random_matrix], dim=0)
+            columns.append("Random Matrix")
+
+        return plot_grid_hist(scores, title="Query Scores", xlabel="Score", stat="density", columns=columns, row_names="layer", col_names="head")
+
+qk = QueryKey(model)
+fig = qk.plot_hist(qk=0, k=0, add_random_matrix=True)
+fig.savefig("images/query_scores_hist.png")
 
 
-model = lap
-singular_direction_idx = 2
+# qk.draw_upper_outlier(qk=0, ep=1, layer=0, head=0, k=0, output="images/query_pos_1_1_0.png")
 
 
-
-torch.kl_div((model.WE @ model.query_side)[..., 0].log(), (model.WPos @ model.query_side)[..., 0])
-
-query_scores = torch.cat([
-    model.WE @ model.query_side[..., singular_direction_idx, None], 
-    model.WPos @ model.query_side[..., singular_direction_idx, None],
-], dim=-1)
-
-plot_grid_hist(query_scores, title="How well does WE align with U*sqrt(S)", xlabel="Scores on singular vectors", ylabel="Count", columns=["WE", "WPos"])
-
-key_scores = torch.cat([
-    model.WE @ model.key_side.transpose(-1, -2)[..., singular_direction_idx, None], 
-    model.WPos @ model.key_side.transpose(-1, -2)[..., singular_direction_idx, None],
-], dim=-1)
-
-plot_grid_hist(key_scores, title="How well does WE align with sqrt(S)*V.T", xlabel="Scores on singular vectors", ylabel="Count", columns=["WE", "WPos"])

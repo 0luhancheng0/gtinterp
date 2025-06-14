@@ -8,6 +8,31 @@ from jaxtyping import Float
 from typing import Union
 
 
+def plot_grid_hist(scores: Float[torch.Tensor, "hue *grid node"], title: str, xlabel, stat="density", columns=None, row_names="layer", col_names="head") -> plt.Figure:
+    # Extract grid dimensions similar to plot_grid_heatmaps
+    _, rows, cols, _ = scores.shape
+    df_list = []
+    ax_name = lambda i, j: f'{row_names}_{i}_{col_names}_{j}'
+    for i in range(rows):
+        for j in range(cols):
+            df_temp = pd.DataFrame(scores[:, i, j].detach().cpu().numpy().T, columns=columns)
+            df_temp['source'] = ax_name(i, j)
+            df_list.append(df_temp)
+    df = pd.concat(df_list, ignore_index=True)
+    fig, axes = plt.subplots(figsize=(cols * 5, rows * 4), nrows=rows, ncols=cols, sharex=True, sharey=True, squeeze=False)
+    for i in range(rows):
+        for j in range(cols):
+            ax = axes[i, j]
+            # Filter data for this specific layer-head combination
+            subset_data = df[df['source'] == ax_name(i, j)]
+            sns.histplot(subset_data.drop(columns=['source']), ax=ax, stat=stat)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(stat)
+            ax.set_title(ax_name(i, j))
+    
+    fig.suptitle(title)
+    fig.tight_layout()
+    return fig
 
 def plot_heatmap(data_tensor: torch.Tensor, title: str, xlabel: str, ylabel: str) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(8, 6))

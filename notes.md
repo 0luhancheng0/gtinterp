@@ -71,7 +71,24 @@ This roughly tells you that during the training, the attention matrix learned te
 
 So how does graph transformer incorporate graph into learning? There are 2 kinds of privileged basis specification on graph information. The positional embedding and the attention mask. The positional encoding is probably easier to interpret as it is commonly just chosen as the first d_model eigenvectors of the graph laplacian. 
 
+
+## Positional encoding detect small community
+
+I project botb $W_E$ and $W_{pos}$ (obtained as laplacian positional encodings) onto the first singular vector on the query side (with the singular value absorpted into it) and get the following histogram. 
+![query scores hist](images/query_scores_hist.png)
+
+The embedding matrix behave pretty much like random matrix. But the positional encoding has very long tail with most of density concentrated at 0. So it seems like QK is specifically picking out the nodes in the specific positions in the graph. 
+
+Here it shows which nodes that are 3 sigma away in the first singular direction. 
+![network drawing](images/query_pos_1_1_0.png)
+
+It seems the first singular direction is basically detecting some small community. 
+
+
+
+
+<!-- 
 TODO:
-- I plan to first ablate the attention mask component to isolate the impact of the positional encoding. Since the start of the residual stream is just $W_E + W_{pos}$ it should be possible to fully characterise the interactions between them. Ideally we should also be able to figure out how their interactions are learned during the training therefore see if graph transformer is really using the graph. 
+- I plan to first ablate the attention mask component to isolate the impact of the positional encoding. Since the start of the residual stream is just $W_E + W_{pos}$ it should be possible to fully characterise the interactions between them. Ideally we should also be able to figure out how their interactions are learned during the training therefore see if graph transformer is really using the graph.  -->
 
 
