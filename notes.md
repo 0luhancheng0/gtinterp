@@ -32,15 +32,10 @@ In the following plot, I run logit attribution again, but only for those nodes h
 
 Here we expect most if not all values to be positive. We can see (1, 1) is pretty indifferent in 0->6 direction for general population, but its not doing well for true samples. 
 
-
-
 ![unmasked random](images/unmasked_random.png)
 
 This figure above is one I found kind of interesting. Note that this is from a regular transformer trained on cora dataset, which means random orthogonal positional encoding and no masking. It seems like the head in the first layer is pushing the prediction towards later half of classes, and the head in the second layer is pushing prediction towards odd classes. This kind of make sense as our output vocab can be directly thought as feature direction. So i guess this could be another example of superposition if i'm not reading too much into it.
 
-
-
-Now im kinda stuck, because we don't actually understand the input tokens. Note that the features of cora are a bunch of one-hot encoding of words but I cannot find the underlying vocabulary even after scortching the internet.
 
 # Homophily and label informativeness
 
@@ -87,8 +82,8 @@ It seems the first singular direction is basically detecting some small communit
 
 
 
-<!-- 
+
 TODO:
-- I plan to first ablate the attention mask component to isolate the impact of the positional encoding. Since the start of the residual stream is just $W_E + W_{pos}$ it should be possible to fully characterise the interactions between them. Ideally we should also be able to figure out how their interactions are learned during the training therefore see if graph transformer is really using the graph.  -->
+- I plan to first ablate the attention mask component to isolate the impact of the positional encoding. Since the start of the residual stream is just $W_E + W_{pos}$ it should be possible to fully characterise the interactions between them. Ideally we should also be able to figure out how their interactions are learned during the training therefore see if graph transformer is really using the graph. 
 
 

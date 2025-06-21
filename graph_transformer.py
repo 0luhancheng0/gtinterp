@@ -1,4 +1,4 @@
-%matplotlib inline
+# %matplotlib inline
 from torch_geometric.utils import to_undirected, degree, get_ppr, get_laplacian
 from lightning.pytorch.utilities import grad_norm
 from pathlib import Path
@@ -50,7 +50,9 @@ import einops
 import numpy as np
 DATASET_ROOT = "/home/lcheng/oz318/datasets/pytorch_geometric"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+D_MODEL = 32
+D_HEAD = 8
+MAX_EPOCHS = 50
 
 def attention_mask_hook_factory(
     adj: Float[torch.Tensor, "nodes nodes"],
@@ -387,16 +389,7 @@ def get_samples_maximise_loss(model, data, num_samples=100, device=DEVICE):
     y_pred = output.logits.squeeze(0)[idx.indices].argmax(dim=-1)
     return output, y_true, y_pred, idx
 
-
-d_model = 32
-max_epochs = 50
-d_head = 8
-
-
-
-
-
-def prepare(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads, device=DEVICE):
+def prepare(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads, device=DEVICE, d_model=D_MODEL, d_head=D_HEAD, max_epochs=MAX_EPOCHS):
     exp_prefix = f"{'masked' if masked else 'unmasked'}_{'random' if random_orthogonal_pos_init else 'lappe'}_{dataset_name}_{n_layers}_{n_heads}"
     
     L.seed_everything(123)
@@ -440,12 +433,22 @@ def prepare(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads,
     model = GraphTransformer(cfg, data, apply_neighbor_mask=masked)
     return trainer, model, datamodule
 
-def load_model(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads, device=DEVICE):
+def load_model(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads, device=DEVICE, return_ckpt=False):
     trainer, model, _ = prepare(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads)
     ckpt = torch.load(f"{trainer.logger.log_dir}/checkpoints/last.ckpt", map_location=device)
     model.load_state_dict(ckpt['state_dict'])
     model.update_cache()
+    model.to(device)
+    model.eval()
+    if return_ckpt:
+        return model, ckpt
     return model
+
+def is_experiment_completed(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads):
+    """Check if an experiment is already completed by looking for the checkpoint file."""
+    exp_prefix = f"{'masked' if masked else 'unmasked'}_{'random' if random_orthogonal_pos_init else 'lappe'}_{dataset_name}_{n_layers}_{n_heads}"
+    checkpoint_path = Path(f"./loggings/{exp_prefix}/0/checkpoints/last.ckpt")
+    return checkpoint_path.exists()
 
 def run(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads):
     trainer, model, datamodule = prepare(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads)
@@ -457,23 +460,14 @@ def run_all():
         for n_layers, n_heads in [(1, 1), (2, 1), (1, 2), (2, 2)]:
             for masked in [True, False]:
                 for random_orthogonal_pos_init in [True, False]:
+                    if is_experiment_completed(masked, random_orthogonal_pos_init, dataset_name, n_layers, n_heads):
+                        exp_prefix = f"{'masked' if masked else 'unmasked'}_{'random' if random_orthogonal_pos_init else 'lappe'}_{dataset_name}_{n_layers}_{n_heads}"
+                        print(f"Skipping completed experiment: {exp_prefix}")
+                        continue
                     run(masked=masked, random_orthogonal_pos_init=random_orthogonal_pos_init, dataset_name=dataset_name, n_layers=n_layers, n_heads=n_heads)
 
-
-# run(masked=True, random_orthogonal_pos_init=False, dataset_name="citeseer", n_layers=2, n_heads=2)
-
-trainer, model, datamodule = prepare(masked=True, random_orthogonal_pos_init=False, dataset_name="cora", n_layers=2, n_heads=2)
-
-# model = load_model(masked=True, random_orthogonal_pos_init=False, dataset_name="cora", n_layers=2, n_heads=2)
-
-# WE_key_scores = rearrange(model.key_scores(model.WE), "... d_head -> d_head ...")
-# WE_query_scores = rearrange(model.query_scores(model.WE), "... d_head -> d_head ...")
-# WPos_key_scores = rearrange(model.key_scores(model.WPos), "... d_head -> d_head ...")
-# WPos_query_scores = rearrange(model.query_scores(model.WPos), "... d_head -> d_head ...")
-
-
 class QueryKey:
-    def __init__(self, model, sigma=3):
+    def __init__(self, model, sigma=2):
         self.model = model
         self.sigma = sigma
         self.WE = self.model.WE
@@ -488,6 +482,7 @@ class QueryKey:
         upper = (scores.mean(dim=dim) + self.sigma * scores.std(dim=dim)).unsqueeze(dim)
         lower = (scores.mean(dim=dim) - self.sigma * scores.std(dim=dim)).unsqueeze(dim)
         return lower, upper
+    
     @torch.no_grad()
     def get_scores(self) -> Float[Tensor, "qk ep layer head node d_model"]:
         query_scores = self.model.query_scores(torch.stack([self.WE, self.WPos], dim=0))
@@ -497,9 +492,14 @@ class QueryKey:
     def draw_upper_outlier(self, qk, ep, layer, head, k, **kwargs):
         vp = self.graph.new_vp("bool", ~self.upper_outlier_mask[qk, ep, layer, head, :, k])
         return self._draw_with_vertex_mask(vp, **kwargs)
+    
+    def draw_lower_outlier(self, qk, ep, layer, head, k, **kwargs):
+        vp = self.graph.new_vp("bool", ~self.lower_outlier_mask[qk, ep, layer, head, :, k])
+        return self._draw_with_vertex_mask(vp, **kwargs)
 
     def _draw_with_vertex_mask(self, vertex_mask: Bool[torch.Tensor, "node"], **kwargs):
-        return gt.graph_draw(g=self.graph, pos=self.graph.vp['pos'], vertex_fill_color=vertex_mask, bg_color=(0, 0, 0, 1), **kwargs)
+        return gt.graph_draw(g=self.graph, pos=self.graph.vp['pos'], vertex_fill_color=vertex_mask, bg_color=(0, 0, 0, 1), inline=True, **kwargs)
+
     def plot_hist(self, qk, k, add_random_matrix=False):
         scores = self.scores[qk, ..., k]
         columns = ["WE", "WPos"]
@@ -510,11 +510,6 @@ class QueryKey:
 
         return plot_grid_hist(scores, title="Query Scores", xlabel="Score", stat="density", columns=columns, row_names="layer", col_names="head")
 
-qk = QueryKey(model)
-fig = qk.plot_hist(qk=0, k=0, add_random_matrix=True)
-fig.savefig("images/query_scores_hist.png")
 
-
-# qk.draw_upper_outlier(qk=0, ep=1, layer=0, head=0, k=0, output="images/query_pos_1_1_0.png")
-
-
+if __name__ == "__main__":
+    run_all()

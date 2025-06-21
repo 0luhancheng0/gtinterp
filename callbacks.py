@@ -41,27 +41,32 @@ class BaseAnalysisCallback(Callback, ABC):
         pass
     
     @abstractmethod
-    def plot(self) -> Dict[str, plt.Figure]:
+    def plot(self, axes_dict: Dict[str, any] = None) -> Dict[str, plt.Figure]:
         """Create plots for analysis results.
+        
+        Args:
+            axes_dict: Optional dictionary mapping plot names to axes objects
         
         Returns:
             Dict[str, plt.Figure]: Dictionary mapping plot names to figures
         """
         pass
     
-    def log_plots(self, trainer, pl_module, prefix: str = ""):
+    def log_plots(self, trainer, pl_module, prefix: str = "", axes_dict: Dict[str, any] = None):
         """Log all plots to trainer.
         
         Args:
             trainer: Lightning trainer instance
             pl_module: Lightning module instance
             prefix: Optional prefix for plot names
+            axes_dict: Optional dictionary mapping plot names to axes objects
         """
-        fig_dict = self.plot()
+        fig_dict = self.plot(axes_dict)
         for key, fig in fig_dict.items():
-            plot_name = f"{prefix}/{key}" if prefix else key
-            trainer.logger.experiment.add_figure(plot_name, fig, pl_module.current_epoch)
-            plt.close(fig)
+            if fig is not None:  # Only log if a figure was created
+                plot_name = f"{prefix}/{key}" if prefix else key
+                trainer.logger.experiment.add_figure(plot_name, fig, pl_module.current_epoch)
+                plt.close(fig)
     
     def on_train_end(self, trainer, pl_module):
         """Default implementation: compute then log plots."""
@@ -88,16 +93,17 @@ class HeadAblationCallback(BaseAnalysisCallback):
             output = pl_module(torch.arange(pl_module.data.num_nodes), update_cache=False, custom_hooks=[head_ablation_hook(layer, head)])
             self.loss_increase[layer, head] = output.loss - loss_orig
 
-    def plot(self):
+    def plot(self, axes_dict: Dict[str, any] = None):
         """Create plots for head ablation results."""
-        return {
-            "head_ablation": plot_heatmap(
-                self.loss_increase, 
-                "Head Ablation Loss Increase", 
-                "Head", 
-                "Layer"
-            )
-        }
+        ax = axes_dict.get("head_ablation") if axes_dict else None
+        fig = plot_heatmap(
+            self.loss_increase, 
+            "Head Ablation Loss Increase", 
+            "Head", 
+            "Layer",
+            ax=ax
+        )
+        return {"head_ablation": fig}
 
 
 class LogTrainingAttention(BaseAnalysisCallback):
@@ -173,46 +179,62 @@ class LogTrainingAttention(BaseAnalysisCallback):
         
         return attention_per_distance
 
-    def plot(self):
+    def plot(self, axes_dict: Dict[str, any] = None):
         """Create all plots for training attention analysis."""
         fig_dict = {}
         
         # Plot edge homophily
         for i in range(self.training_edge_homophily.shape[-1]):  # num_classes
-            fig_dict[f"training_edge_homophily/{i}"] = plot_epoch_layer_head_curves(
+            plot_key = f"training_edge_homophily/{i}"
+            ax = axes_dict.get(plot_key) if axes_dict else None
+            fig = plot_epoch_layer_head_curves(
                 self.training_edge_homophily[:, :, :, i], 
                 "Attention Induced Edge Homophily", 
                 "Epoch", 
                 "Attention Induced Edge Homophily", 
-                "Layer_Head"
+                "Layer_Head",
+                ax=ax
             )
+            fig_dict[plot_key] = fig
         
-        fig_dict["training_edge_homophily/total"] = plot_epoch_layer_head_curves(
+        plot_key = "training_edge_homophily/total"
+        ax = axes_dict.get(plot_key) if axes_dict else None
+        fig = plot_epoch_layer_head_curves(
             reduce(self.training_edge_homophily, "epoch layer head class -> epoch layer head", reduction="sum"), 
             "Attention Induced Edge Homophily", 
             "Epoch", 
             "Attention Induced Edge Homophily", 
-            "Layer_Head"
+            "Layer_Head",
+            ax=ax
         )
+        fig_dict[plot_key] = fig
         
         # Plot label informativeness
-        fig_dict["training_label_informativeness"] = plot_epoch_layer_head_curves(
+        plot_key = "training_label_informativeness"
+        ax = axes_dict.get(plot_key) if axes_dict else None
+        fig = plot_epoch_layer_head_curves(
             self.label_info,
             title="Label Informativeness",
             xlabel="Epoch",
             ylabel="Informativeness",
-            legend_title="Layer_Head"
+            legend_title="Layer_Head",
+            ax=ax
         )
+        fig_dict[plot_key] = fig
         
         # Plot attention per distance
         for k, attention_data in self.attention_per_distance.items():
-            fig_dict[f"training_attention/{k}"] = plot_epoch_layer_head_curves(
+            plot_key = f"training_attention/{k}"
+            ax = axes_dict.get(plot_key) if axes_dict else None
+            fig = plot_epoch_layer_head_curves(
                 attention_data, 
                 title=f"Attention Patterns (Distance {k})", 
                 xlabel="Epoch", 
                 ylabel="Attention", 
-                legend_title="Layer_Head"
+                legend_title="Layer_Head",
+                ax=ax
             )
+            fig_dict[plot_key] = fig
         
         return fig_dict
 
@@ -322,103 +344,167 @@ class LogitAttribution(BaseAnalysisCallback):
         """
         layer, head, nodes, c1, c2 = self.logit_attrs.shape
         idx = index_over_class[None, None, :, None, None].expand(layer, head, -1, 1, c2)
-        logits = self.logit_attrs.gather(index=idx, dim=-2).squeeze()  # shape: layer, head, nodes, c2
+        logits = self.logit_attrs.gather(index=idx, dim=-2).squeeze(dim=-2)  # shape: layer, head, nodes, c2
 
         return scatter_mean(src=logits, index=index_over_class, dim=-2, dim_size=pl_module.num_classes)
 
 
-    def plot(self):
+    def plot(self, axes_dict: Dict[str, any] = None):
         """Create all plots for logit attribution analysis."""
         fig_dict = {}
         
         # Add plots for each metric category
-        fig_dict.update(self._plot_average_logits())
-        fig_dict.update(self._plot_true_class_logits())
-        fig_dict.update(self._plot_predicted_class_logits())
-        fig_dict.update(self._plot_normalized_logits())
+        fig_dict.update(self._plot_average_logits(axes_dict))
+        fig_dict.update(self._plot_true_class_logits(axes_dict))
+        fig_dict.update(self._plot_predicted_class_logits(axes_dict))
+        fig_dict.update(self._plot_normalized_logits(axes_dict))
         
         return fig_dict
 
-    def _plot_average_logits(self):
+    def _plot_average_logits(self, axes_dict: Dict[str, any] = None):
         """Create plots for average logit attributions (baseline)."""
-        return {
-            "avg_logits_per_layer_head": plot_grid_heatmaps(
-                data_tensor=self.avg_logits_per_layer_head,
-                title_prefix="Average Logit Attribution per Head (All Nodes)",
-                xlabel="From Class",
-                ylabel="To Class"
-            ),
-            "avg_logits_sum_all": plot_heatmap(
-                data_tensor=self.avg_logits_sum_all,
-                title="Sum of Average Logit Attributions (All Nodes, All Heads/Layers)",
-                xlabel="From Class",
-                ylabel="To Class"
-            )
-        }
+        fig_dict = {}
+        
+        # Plot per layer head
+        plot_key = "avg_logits_per_layer_head"
+        axes = axes_dict.get(plot_key) if axes_dict else None
+        fig = plot_grid_heatmaps(
+            data_tensor=self.avg_logits_per_layer_head,
+            title_prefix="Average Logit Attribution per Head (All Nodes)",
+            xlabel="From Class",
+            ylabel="To Class",
+            axes=axes
+        )
+        fig_dict[plot_key] = fig
+        
+        # Plot sum all
+        plot_key = "avg_logits_sum_all"
+        ax = axes_dict.get(plot_key) if axes_dict else None
+        fig = plot_heatmap(
+            data_tensor=self.avg_logits_sum_all,
+            title="Sum of Average Logit Attributions (All Nodes, All Heads/Layers)",
+            xlabel="From Class",
+            ylabel="To Class",
+            ax=ax
+        )
+        fig_dict[plot_key] = fig
+        
+        return fig_dict
 
-    def _plot_true_class_logits(self):
+    def _plot_true_class_logits(self, axes_dict: Dict[str, any] = None):
         """Create plots for true class logit attributions."""
-        return {
-            "true_logits_per_layer_head": plot_grid_heatmaps(
-                data_tensor=self.true_logits_per_layer_head,
-                title_prefix="Average Logit Attribution per Head (Nodes of True Class)",
-                xlabel="From Class",
-                ylabel="To Class"
-            ),
-            "true_logits_sum_all": plot_heatmap(
-                data_tensor=self.true_logits_sum_all,
-                title="Sum of Average Logit Attributions (Nodes of True Class, All Heads/Layers)",
-                xlabel="From Class",
-                ylabel="To Class"
-            )
-        }
+        fig_dict = {}
+        
+        # Plot per layer head
+        plot_key = "true_logits_per_layer_head"
+        axes = axes_dict.get(plot_key) if axes_dict else None
+        fig = plot_grid_heatmaps(
+            data_tensor=self.true_logits_per_layer_head,
+            title_prefix="Average Logit Attribution per Head (Nodes of True Class)",
+            xlabel="From Class",
+            ylabel="To Class",
+            axes=axes
+        )
+        fig_dict[plot_key] = fig
+        
+        # Plot sum all
+        plot_key = "true_logits_sum_all"
+        ax = axes_dict.get(plot_key) if axes_dict else None
+        fig = plot_heatmap(
+            data_tensor=self.true_logits_sum_all,
+            title="Sum of Average Logit Attributions (Nodes of True Class, All Heads/Layers)",
+            xlabel="From Class",
+            ylabel="To Class",
+            ax=ax
+        )
+        fig_dict[plot_key] = fig
+        
+        return fig_dict
 
-    def _plot_predicted_class_logits(self):
+    def _plot_predicted_class_logits(self, axes_dict: Dict[str, any] = None):
         """Create plots for predicted class logit attributions."""
-        return {
-            "pred_logits_per_layer_head": plot_grid_heatmaps(
-                data_tensor=self.pred_logits_per_layer_head,
-                title_prefix="Average Logit Attribution per Head (Nodes of Predicted Class)",
-                xlabel="From Class",
-                ylabel="To Class"
-            ),
-            "pred_logits_sum_all": plot_heatmap(
-                data_tensor=self.pred_logits_sum_all,
-                title="Sum of Average Logit Attributions (Nodes of Predicted Class, All Heads/Layers)",
-                xlabel="From Class",
-                ylabel="To Class"
-            )
-        }
+        fig_dict = {}
+        
+        # Plot per layer head
+        plot_key = "pred_logits_per_layer_head"
+        axes = axes_dict.get(plot_key) if axes_dict else None
+        fig = plot_grid_heatmaps(
+            data_tensor=self.pred_logits_per_layer_head,
+            title_prefix="Average Logit Attribution per Head (Nodes of Predicted Class)",
+            xlabel="From Class",
+            ylabel="To Class",
+            axes=axes
+        )
+        fig_dict[plot_key] = fig
+        
+        # Plot sum all
+        plot_key = "pred_logits_sum_all"
+        ax = axes_dict.get(plot_key) if axes_dict else None
+        fig = plot_heatmap(
+            data_tensor=self.pred_logits_sum_all,
+            title="Sum of Average Logit Attributions (Nodes of Predicted Class, All Heads/Layers)",
+            xlabel="From Class",
+            ylabel="To Class",
+            ax=ax
+        )
+        fig_dict[plot_key] = fig
+        
+        return fig_dict
 
-    def _plot_normalized_logits(self):
+    def _plot_normalized_logits(self, axes_dict: Dict[str, any] = None):
         """Create plots for normalized (difference from baseline) logit attributions."""
-        return {
-            "normed_true_logits_per_layer_head": plot_grid_heatmaps(
-                data_tensor=self.normed_true_logits_per_layer_head,
-                title_prefix="Difference: (True Class Nodes Avg Logit Attr) - (All Nodes Avg Logit Attr) per Head",
-                xlabel="From Class",
-                ylabel="To Class"
-            ),
-            "normed_true_logits_sum_all": plot_heatmap(
-                data_tensor=self.normed_true_logits_sum_all,
-                title="Sum of Difference: (True Class Nodes Avg Logit Attr) - (All Nodes Avg Logit Attr)",
-                xlabel="From Class",
-                ylabel="To Class"
-            ),
-            "normed_pred_logits_per_layer_head": plot_grid_heatmaps(
-                data_tensor=self.normed_pred_logits_per_layer_head,
-                title_prefix="Difference: (Predicted Class Nodes Avg Logit Attr) - (All Nodes Avg Logit Attr) per Head",
-                xlabel="From Class",
-                ylabel="To Class"
-            ),
-            "normed_pred_logits_sum_all": plot_heatmap(
-                data_tensor=self.normed_pred_logits_sum_all,
-                title="Sum of Difference: (Predicted Class Nodes Avg Logit Attr) - (All Nodes Avg Logit Attr)",
-                xlabel="From Class",
-                ylabel="To Class"
-            )
-        }
+        fig_dict = {}
+        
+        # True class normalized per layer head
+        plot_key = "normed_true_logits_per_layer_head"
+        axes = axes_dict.get(plot_key) if axes_dict else None
+        fig = plot_grid_heatmaps(
+            data_tensor=self.normed_true_logits_per_layer_head,
+            title_prefix="Difference: (True Class Nodes Avg Logit Attr) - (All Nodes Avg Logit Attr) per Head",
+            xlabel="From Class",
+            ylabel="To Class",
+            axes=axes
+        )
+        fig_dict[plot_key] = fig
+        
+        # True class normalized sum all
+        plot_key = "normed_true_logits_sum_all"
+        ax = axes_dict.get(plot_key) if axes_dict else None
+        fig = plot_heatmap(
+            data_tensor=self.normed_true_logits_sum_all,
+            title="Sum of Difference: (True Class Nodes Avg Logit Attr) - (All Nodes Avg Logit Attr)",
+            xlabel="From Class",
+            ylabel="To Class",
+            ax=ax
+        )
+        fig_dict[plot_key] = fig
+        
+        # Predicted class normalized per layer head
+        plot_key = "normed_pred_logits_per_layer_head"
+        axes = axes_dict.get(plot_key) if axes_dict else None
+        fig = plot_grid_heatmaps(
+            data_tensor=self.normed_pred_logits_per_layer_head,
+            title_prefix="Difference: (Predicted Class Nodes Avg Logit Attr) - (All Nodes Avg Logit Attr) per Head",
+            xlabel="From Class",
+            ylabel="To Class",
+            axes=axes
+        )
+        fig_dict[plot_key] = fig
+        
+        # Predicted class normalized sum all
+        plot_key = "normed_pred_logits_sum_all"
+        ax = axes_dict.get(plot_key) if axes_dict else None
+        fig = plot_heatmap(
+            data_tensor=self.normed_pred_logits_sum_all,
+            title="Sum of Difference: (Predicted Class Nodes Avg Logit Attr) - (All Nodes Avg Logit Attr)",
+            xlabel="From Class",
+            ylabel="To Class",
+            ax=ax
+        )
+        fig_dict[plot_key] = fig
+        
+        return fig_dict
 
-    def log_plots(self, trainer, pl_module, prefix: str = "LogitsAttribution"):
+    def log_plots(self, trainer, pl_module, prefix: str = "LogitsAttribution", axes_dict: Dict[str, any] = None):
         """Log all plots to trainer with LogitsAttribution prefix."""
-        super().log_plots(trainer, pl_module, prefix)
+        super().log_plots(trainer, pl_module, prefix, axes_dict)

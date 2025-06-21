@@ -8,7 +8,7 @@ from jaxtyping import Float
 from typing import Union
 
 
-def plot_grid_hist(scores: Float[torch.Tensor, "hue *grid node"], title: str, xlabel, stat="density", columns=None, row_names="layer", col_names="head") -> plt.Figure:
+def plot_grid_hist(scores: Float[torch.Tensor, "hue *grid node"], title: str, xlabel, stat="density", columns=None, row_names="layer", col_names="head", axes=None) -> Union[plt.Figure, None]:
     # Extract grid dimensions similar to plot_grid_heatmaps
     _, rows, cols, _ = scores.shape
     df_list = []
@@ -19,10 +19,24 @@ def plot_grid_hist(scores: Float[torch.Tensor, "hue *grid node"], title: str, xl
             df_temp['source'] = ax_name(i, j)
             df_list.append(df_temp)
     df = pd.concat(df_list, ignore_index=True)
-    fig, axes = plt.subplots(figsize=(cols * 5, rows * 4), nrows=rows, ncols=cols, sharex=True, sharey=True, squeeze=False)
+    
+    # Create figure and axes if not provided
+    if axes is None:
+        fig, axes = plt.subplots(figsize=(cols * 5, rows * 4), nrows=rows, ncols=cols, sharex=True, sharey=True, squeeze=False)
+        created_fig = True
+    else:
+        fig = None
+        created_fig = False
+        # Ensure axes is 2D array
+        if hasattr(axes, 'shape') and len(axes.shape) == 1:
+            axes = axes.reshape(rows, cols)
+        elif not hasattr(axes, '__getitem__'):
+            # Single axis provided for grid - this would be an error
+            raise ValueError(f"Expected {rows}x{cols} grid of axes, but got single axis")
+    
     for i in range(rows):
         for j in range(cols):
-            ax = axes[i, j]
+            ax = axes[i, j] if hasattr(axes[i], '__getitem__') else axes[i]
             # Filter data for this specific layer-head combination
             subset_data = df[df['source'] == ax_name(i, j)]
             sns.histplot(subset_data.drop(columns=['source']), ax=ax, stat=stat)
@@ -30,35 +44,63 @@ def plot_grid_hist(scores: Float[torch.Tensor, "hue *grid node"], title: str, xl
             ax.set_ylabel(stat)
             ax.set_title(ax_name(i, j))
     
-    fig.suptitle(title)
-    fig.tight_layout()
-    return fig
+    if created_fig:
+        fig.suptitle(title)
+        fig.tight_layout()
+        return fig
+    return None
 
-def plot_heatmap(data_tensor: torch.Tensor, title: str, xlabel: str, ylabel: str) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(8, 6))
+def plot_heatmap(data_tensor: torch.Tensor, title: str, xlabel: str, ylabel: str, ax=None) -> Union[plt.Figure, None]:
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        created_fig = True
+    else:
+        fig = None
+        created_fig = False
+        
     sns.heatmap(data_tensor.cpu().detach(), cbar=True, ax=ax, center=0, annot=True, cmap="viridis")
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    return fig
+    
+    if created_fig:
+        return fig
+    return None
 
 
-def plot_grid_heatmaps(data_tensor: Float[Tensor, "*grid c1 c2"], title_prefix: str, xlabel: str, ylabel: str) -> plt.Figure:
+def plot_grid_heatmaps(data_tensor: Float[Tensor, "*grid c1 c2"], title_prefix: str, xlabel: str, ylabel: str, axes=None) -> Union[plt.Figure, None]:
     # rows, cols = data_tensor.shape[2:]
     rows, cols, _, _ = data_tensor.shape
-    fig, axes = plt.subplots(rows, cols,
-                             figsize=(cols * 7, rows * 6),  # Increased figure size for titles
-                             squeeze=False)
-    fig.suptitle(title_prefix, fontsize=16, y=1.02) # Add super title for the grid
+    
+    # Create figure and axes if not provided
+    if axes is None:
+        fig, axes = plt.subplots(rows, cols,
+                                 figsize=(cols * 7, rows * 6),  # Increased figure size for titles
+                                 squeeze=False)
+        created_fig = True
+    else:
+        fig = None
+        created_fig = False
+        # Ensure axes is 2D array
+        if hasattr(axes, 'shape') and len(axes.shape) == 1:
+            axes = axes.reshape(rows, cols)
+        elif not hasattr(axes, '__getitem__'):
+            # Single axis provided for grid - this would be an error
+            raise ValueError(f"Expected {rows}x{cols} grid of axes, but got single axis")
+    
     for i in range(rows):
         for j in range(cols):
-            ax = axes[i, j]
+            ax = axes[i, j] if hasattr(axes[i], '__getitem__') else axes[i]
             sns.heatmap(data_tensor[i, j, :, :].cpu().detach(), cbar=True, ax=ax, center=0, annot=True, cmap="viridis")
             ax.set_title(f"Layer {i}, Head {j}")
             ax.set_xlabel(xlabel)
             ax.set_ylabel(ylabel)
-    plt.tight_layout(rect=[0, 0, 1, 0.98]) # Adjust layout to make space for suptitle
-    return fig
+    
+    if created_fig:
+        fig.suptitle(title_prefix, fontsize=16, y=1.02) # Add super title for the grid
+        plt.tight_layout(rect=[0, 0, 1, 0.98]) # Adjust layout to make space for suptitle
+        return fig
+    return None
 
 
 def plot_epoch_layer_head_curves(
@@ -66,8 +108,9 @@ def plot_epoch_layer_head_curves(
     title: str, 
     xlabel: str, 
     ylabel: str, 
-    legend_title: str
-) -> plt.Figure:
+    legend_title: str,
+    ax=None
+) -> Union[plt.Figure, None]:
     """Plot line curves showing evolution of metrics over epochs for different layer-head combinations.
     
     Args:
@@ -77,30 +120,42 @@ def plot_epoch_layer_head_curves(
         xlabel: X-axis label  
         ylabel: Y-axis label
         legend_title: Legend title
+        ax: Optional matplotlib axis to plot on
         
     Returns:
-        plt.Figure: The created figure
+        plt.Figure or None: The created figure if ax was None, otherwise None
     """
     # Convert tensor to DataFrame if needed
     if isinstance(data, torch.Tensor):
         df_long = create_melted_dataframe_from_tensor(data)
     else:
         df_long = data
+    
+    if ax is None:
+        fig = plt.figure(figsize=(8, 5))
+        ax = plt.gca()
+        created_fig = True
+    else:
+        fig = None
+        created_fig = False
         
-    fig = plt.figure(figsize=(8, 5))
     sns.lineplot(
         data=df_long,
         x="epoch",
         y="attention",
         hue="layer_head",
-        marker="o"
+        marker="o",
+        ax=ax
     )
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.legend(title=legend_title, bbox_to_anchor=(1.05, 1), loc="upper left")
-    plt.tight_layout()
-    return fig
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.legend(title=legend_title, bbox_to_anchor=(1.05, 1), loc="upper left")
+    
+    if created_fig:
+        plt.tight_layout()
+        return fig
+    return None
 
 
 def create_melted_dataframe_from_tensor(patterns_tensor: Float[torch.Tensor, "epochs layers heads"]):
