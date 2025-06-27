@@ -68,6 +68,17 @@ def plot_heatmap(data_tensor: torch.Tensor, title: str, xlabel: str, ylabel: str
     return None
 
 
+def get_outliers_mask(scores, n=3, dim=-2):
+    upper = (scores.mean(dim=dim) + n * scores.std(dim=dim)).unsqueeze(dim)
+    lower = (scores.mean(dim=dim) - n * scores.std(dim=dim)).unsqueeze(dim)
+    return (scores < lower) | (scores > upper)
+
+# def plot_scores_hist(scores, qk, k):
+    # scores = scores[qk, ..., k]
+    # return plot_grid_hist(scores, title="Query Scores", xlabel="Score", stat="density", columns=["WE", "WPos"], row_names="layer", col_names="head")
+
+
+
 def plot_grid_heatmaps(data_tensor: Float[Tensor, "*grid c1 c2"], title_prefix: str, xlabel: str, ylabel: str, axes=None) -> Union[plt.Figure, None]:
     # rows, cols = data_tensor.shape[2:]
     rows, cols, _, _ = data_tensor.shape

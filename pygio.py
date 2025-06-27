@@ -1,23 +1,51 @@
 import torch
 import lightning as L
+from scipy.sparse.linalg import eigsh
 import torch_geometric.transforms as T
 from torch_geometric.datasets import Planetoid
 from torch_geometric.data import Data
-from torch_geometric.utils import mask_to_index, subgraph, dense_to_sparse
-import os 
-
-from ogb.nodeproppred import PygNodePropPredDataset
+from torch_geometric.utils import mask_to_index, dense_to_sparse
+from torch_geometric.utils import (
+    get_laplacian,
+    to_scipy_sparse_matrix,
+)
 
 import torch_geometric.transforms as T
 import torch
 from torch_geometric.data import Data
-import networkx as nx
 import numpy as np
 
 
 import graph_tool.all as gt
 
 PYG_DATASET_ROOT = "/home/lcheng/oz318/datasets/pytorch_geometric"
+
+def laplacian(data, normalization="sym", dtype=None):
+    edge_index = data.edge_index
+    edge_weight = data.edge_attr if hasattr(data, 'edge_attr') else None
+    edge_index, edge_weight = get_laplacian(edge_index=edge_index, edge_weight=edge_weight, normalization=normalization, num_nodes=data.num_nodes, dtype=dtype)
+    L = to_scipy_sparse_matrix(edge_index, edge_weight, data.num_nodes)
+    return L.todense()
+
+def lap_pe(data, k, normalization="sym", return_eigvals=False, **kwargs):
+    L = laplacian(data, normalization=normalization)
+    eig_vals, eig_vecs = eigsh(  # type: ignore
+        L,
+        k=k,
+        which='SA',
+        return_eigenvectors=True,
+        **kwargs,
+    )
+    eig_vecs = np.real(eig_vecs[:, eig_vals.argsort()])
+    pe = torch.from_numpy(eig_vecs)
+
+    for i in range(pe.shape[1]):
+        max_abs_idx = torch.argmax(torch.abs(pe[:, i]))
+        if pe[max_abs_idx, i] < 0:
+            pe[:, i] *= -1
+    if return_eigvals:
+        return pe, eig_vals[:k]
+    return pe
 
 class StandardizeNodeFeatures(T.BaseTransform):
     def __init__(self, eps=1e-6, keys=["x", "pos"]):
@@ -32,23 +60,6 @@ class StandardizeNodeFeatures(T.BaseTransform):
             data[key] = (data[key] - mean) / (variance + self.eps).sqrt()
         return data
 
-
-
-def pyg_to_gt(data, directed=False):
-    """
-    Convert PyTorch Geometric data object to graph-tool Graph.
-
-    graph = pyg_to_gt(data)
-    vertex_color = graph.new_vp('float', qk[0, 0, :, 7].AB.squeeze().detach().cpu())
-    gt.graph_draw(graph, vertex_fill_color=vertex_color, pos=graph.vp['pos'])
-    """
-    graph = gt.Graph(directed=directed)
-    graph.add_vertex(data.num_nodes)
-    graph.add_edge_list(data.edge_index.T.cpu())
-    graph.vp['y'] = graph.new_vertex_property('int')
-    graph.vp['y'].set_values(data.y.cpu())
-    graph.vp['pos'] = gt.sfdp_layout(graph)
-    return graph
 
 class VirtualNode(T.VirtualNode):
     def forward(self, data):
@@ -86,20 +97,14 @@ class SVDFeatureReduction(T.BaseTransform):
     def forward(self, data: Data) -> Data:
         assert data.x is not None
         data.orig = data.x.clone()  # Store original features
-        if data.x.size(-1) > self.out_channels:
-            U, S, _ = torch.linalg.svd(data.x)
-            data.x = torch.mm(U[:, :self.out_channels],
-                              torch.diag(S[:self.out_channels]))
+        U, S, V = torch.linalg.svd(data.x)
+        # data.x = U[:, :self.out_channels] @ torch.diag(S[:self.out_channels])
+        data.x = U[:, :self.out_channels]
 
         return data
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}({self.out_channels})'
-
-
-
-
-
 
 
 # Add GraphDataModule class definition here
@@ -130,7 +135,53 @@ class OrthogonalPositionalEncoding(T.BaseTransform):
         return data
     
 
-def load_dataset(dataset_name, split="public", num_train_per_class=20, num_val=500, num_test=1000, d_model=128, add_virtual_nodes=False, self_loops=True, undirected=True, random_orthogonal_pos_init=False):
+
+
+class AddLaplacianEigenvectorPE(T.BaseTransform):
+    r"""Adds the Laplacian eigenvector positional encoding from the
+    `"Benchmarking Graph Neural Networks" <https://arxiv.org/abs/2003.00982>`_
+    paper to the given graph
+    (functional name: :obj:`add_laplacian_eigenvector_pe`).
+
+    Args:
+        k (int): The number of non-trivial eigenvectors to consider.
+        attr_name (str, optional): The attribute name of the data object to add
+            positional encodings to. If set to :obj:`None`, will be
+            concatenated to :obj:`data.x`.
+            (default: :obj:`"laplacian_eigenvector_pe"`)
+        is_undirected (bool, optional): If set to :obj:`True`, this transform
+            expects undirected graphs as input, and can hence speed up the
+            computation of eigenvectors. (default: :obj:`False`)
+        **kwargs (optional): Additional arguments of
+            :meth:`scipy.sparse.linalg.eigs` (when :attr:`is_undirected` is
+            :obj:`False`) or :meth:`scipy.sparse.linalg.eigsh` (when
+            :attr:`is_undirected` is :obj:`True`).
+    """
+    # Number of nodes from which to use sparse eigenvector computation:
+    SPARSE_THRESHOLD: int = 100
+
+    def __init__(
+        self,
+        k: int,
+        attr_name = 'laplacian_eigenvector_pe',
+        is_undirected: bool = False,
+        **kwargs,
+    ) -> None:
+        self.k = k
+        self.attr_name = attr_name
+        self.is_undirected = is_undirected
+        self.kwargs = kwargs
+
+    def forward(self, data: Data) -> Data:
+        assert data.edge_index is not None
+        assert data.num_nodes is not None
+        pe, eigvals = lap_pe(data, k=self.k, normalization='sym', return_eigvals=True, **self.kwargs)
+        data[self.attr_name] = pe
+        data["eigvals"] = torch.from_numpy(eigvals)
+        return data
+
+
+def load_dataset(dataset_name, split="public", num_train_per_class=20, num_val=500, num_test=1000, d_model=128, add_virtual_node=False, self_loops=True, laplacian_pos_encoding=True):
     """Load a dataset (Cora, Citeseer, or PubMed) with specified transformations."""
     # Map dataset names to Planetoid dataset names
     dataset_map = {
@@ -144,23 +195,24 @@ def load_dataset(dataset_name, split="public", num_train_per_class=20, num_val=5
     
     # Build transforms
     transforms = []
-    if add_virtual_nodes:
+    if add_virtual_node:
         transforms.append(VirtualNode())
     if self_loops:
         transforms.append(T.AddSelfLoops())
-    if undirected:
-        transforms.append(T.ToUndirected())
+
+    transforms.append(T.ToUndirected())
         
-    if random_orthogonal_pos_init:
-        transforms.append(OrthogonalPositionalEncoding(k=d_model, attr_name="pos"))
+    if laplacian_pos_encoding:
+        transforms.append(AddLaplacianEigenvectorPE(k=d_model, attr_name="pos"))
     else:
-        transforms.append(T.AddLaplacianEigenvectorPE(k=d_model, attr_name="pos"))
+        transforms.append(OrthogonalPositionalEncoding(k=d_model, attr_name="pos"))
+        
         
     transforms.extend([
         SVDFeatureReduction(out_channels=d_model),
         T.ToDense(),
         AddNumClasses(),
-        StandardizeNodeFeatures(eps=1e-6, keys=["x", "pos"])
+        # StandardizeNodeFeatures(eps=1e-6, keys=["x", "pos"])
     ])
     
     transforms = T.Compose(transforms)
